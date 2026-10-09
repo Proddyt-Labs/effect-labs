@@ -1619,6 +1619,7 @@ dependencies = [
  "egui_kittest",
  "image",
  "kurbo",
+ "labs-updater",
  "log",
  "pollster 0.4.0",
  "rayon",
@@ -2969,6 +2970,14 @@ dependencies = [
  "polycool",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "labs-updater"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "serde_json",
 ]
 
 [[package]]
