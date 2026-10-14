@@ -1515,9 +1515,9 @@ impl eframe::App for EffectcraftApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Proddyt Switch: asks to update from the fork's releases (LABS-156).
+        // Proddyt Studio: asks to update from the fork's releases (LABS-156).
 
-        labs_updater::frame(ctx, "effect-labs", "Effect Labs");
+        labs_updater::frame(ctx, "effect-labs", "Studio Effect");
         self.apply_gpu_failure(ctx);
         if !self.styled {
             theme::install(ctx, &self.tokens);
