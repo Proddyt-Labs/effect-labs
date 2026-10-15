@@ -58,6 +58,8 @@ pub struct FaceInfo {
     /// be requested the way After Effects scripts name fonts.
     pub full_name: String,
     pub postscript: Option<String>,
+    /// The face has variation axes (an `fvar` table), read from the table directory at scan time.
+    pub variable: bool,
 }
 
 /// Something that can list fonts (system folders, a web font picker, a project's font folder…).
@@ -87,15 +89,20 @@ impl DirectorySource {
             if let Some(l) = std::env::var_os("LOCALAPPDATA") {
                 dirs.push(PathBuf::from(l).join("Microsoft\\Windows\\Fonts"));
             }
-        } else if cfg!(unix) && !cfg!(target_arch = "wasm32") {
-            dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(PathBuf::from));
-            if let Some(h) = &home {
-                dirs.push(h.join(".local/share/fonts"));
-                dirs.push(h.join(".fonts"));
-            }
         }
+        // Linux/BSD: the usual folders, the XDG data folders, a Flatpak sandbox's host font
+        // folders (/run/host/…) and the folders the fontconfig configuration names.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+        dirs.extend(crate::font_dirs::unix_font_dirs(&crate::font_dirs::FontEnv::from_process()));
+        dirs.extend(extra_dirs(std::env::var_os("EFFECTCRAFT_FONT_DIRS").as_deref()));
         Self { dirs }
     }
+}
+
+/// Extra font folders from `EFFECTCRAFT_FONT_DIRS` (a path list, `:`-separated, `;` on Windows), so a
+/// tool can hand EffectCraft its own font library without installing the fonts system-wide.
+fn extra_dirs(var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    var.map(|v| std::env::split_paths(v).filter(|p| !p.as_os_str().is_empty()).collect()).unwrap_or_default()
 }
 
 fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
@@ -103,7 +110,8 @@ fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            if depth < 4 {
+            // Bounded, so a symlink loop ends.
+            if depth < 8 {
                 walk(&p, depth + 1, out);
             }
         } else if p.extension().and_then(|x| x.to_str()).is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc")) {
@@ -119,6 +127,7 @@ impl FontSource for DirectorySource {
             walk(d, 0, &mut files);
         }
         files.sort();
+        files.dedup();
         let mut out = Vec::new();
         for f in files {
             let Ok(mut file) = std::fs::File::open(&f) else { continue };
@@ -142,6 +151,7 @@ fn info_from(n: FaceNames, data: FaceData, origin: &'static str) -> FaceInfo {
         native_family: n.native_family,
         full_name: n.full_name,
         postscript: n.postscript,
+        variable: n.variable,
     }
 }
 
@@ -207,9 +217,29 @@ impl Face {
     pub fn glyph(&self, c: char) -> Option<u32> {
         self.font()?.charmap().map(c).map(|g| g.to_u32()).filter(|g| *g != 0)
     }
+    /// Whether the face can draw `c`: it maps `c` to a glyph that has an outline, a colour glyph
+    /// or a bitmap. Some fonts map whole scripts to empty glyphs (#285); those don't count, so
+    /// fallback moves on to a face that draws the character. Characters that are blank by nature
+    /// (spaces, format characters) count as covered by any mapping.
     pub fn has_char(&self, c: char) -> bool {
-        self.glyph(c).is_some()
+        self.font().is_some_and(|f| covers(&f, c))
     }
+    /// Horizontal advance and vertical origin above the baseline, in pixels.
+    pub(crate) fn vertical_origin(&self, gid: u32, px: f32) -> Option<(f64, f64)> {
+        use skrifa::raw::TableProvider;
+        let font = self.font()?;
+        let glyph = skrifa::GlyphId::new(gid);
+        let metrics = font.glyph_metrics(Size::unscaled(), LocationRef::default());
+        let origin = match font.vorg() {
+            Ok(table) => f32::from(table.vertical_origin_y(glyph)),
+            Err(_) => metrics.bounds(glyph)?.y_max + f32::from(font.vmtx().ok()?.side_bearing(glyph)?),
+        };
+        let scale = f64::from(px / self.units_per_em());
+        let width = f64::from(metrics.advance_width(glyph)?) * scale;
+        let top = f64::from(origin) * scale;
+        (width.is_finite() && top.is_finite() && top.abs() < f64::from(px) * 4.0).then_some((width, top))
+    }
+
     pub fn metrics(&self, px: f32) -> VMetrics {
         let Some(f) = self.font() else {
             return VMetrics {
@@ -295,6 +325,8 @@ pub fn add_source(src: &dyn FontSource) -> usize {
             n += 1;
         }
     }
+    // A new face can belong to one of a script's usual families.
+    family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
     n
 }
 
@@ -303,7 +335,9 @@ pub fn add_font_data(data: Vec<u8>) -> Vec<FaceId> {
     let data = Arc::new(data);
     let names = read_faces_bytes(&data);
     let mut d = db().write().unwrap_or_else(|e| e.into_inner());
-    names.into_iter().map(|n| push(&mut d, info_from(n, FaceData::Shared(data.clone()), "user"))).collect()
+    let ids = names.into_iter().map(|n| push(&mut d, info_from(n, FaceData::Shared(data.clone()), "user"))).collect();
+    family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+    ids
 }
 
 /// Held for a whole system scan: a concurrent caller waits for the complete list instead of
@@ -373,6 +407,13 @@ pub fn all_faces() -> Vec<Arc<Face>> {
 pub fn native_families() -> std::collections::BTreeMap<String, String> {
     scan_system();
     all_faces().into_iter().filter_map(|f| Some((f.info.family.clone(), f.info.native_family.clone()?))).collect()
+}
+
+/// Families with at least one variable face (variation axes), for the font menu's Variable
+/// Fonts filter. Scans the system fonts first if that hasn't happened yet.
+pub fn variable_families() -> std::collections::BTreeSet<String> {
+    scan_system();
+    all_faces().into_iter().filter(|f| f.info.variable).map(|f| f.info.family.clone()).collect()
 }
 
 /// Families with their style names, sorted by family; styles in weight order. This is what font
@@ -484,7 +525,8 @@ fn resolve_by_name(name: &str) -> Option<Resolved> {
 
 /// The writing systems that need a dedicated fallback family: the bundled fonts cover none of
 /// them, and picking "any face with the glyph" gives Chinese glyph shapes to Japanese text (or the
-/// other way round), since Han ideographs are shared.
+/// other way round), since Han ideographs are shared, and a calligraphic display face to Arabic,
+/// Hebrew, Indic or Thai text when that is the first installed face that covers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FallbackScript {
     /// Kana: unambiguously Japanese.
@@ -494,7 +536,21 @@ enum FallbackScript {
     /// Han ideographs, CJK punctuation and full-width forms: shared by Japanese, Chinese and
     /// Korean; the locale decides which family to try first.
     Han,
+    Arabic,
+    Hebrew,
+    /// Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam and
+    /// Sinhala (one family covers them all on Windows; elsewhere each has its own).
+    Indic,
+    Thai,
     Other,
+}
+
+impl FallbackScript {
+    /// Kana, Hangul or Han: these share the Han ideographs, so each tries the others' families
+    /// next.
+    fn is_cjk(self) -> bool {
+        matches!(self, FallbackScript::Japanese | FallbackScript::Korean | FallbackScript::Han)
+    }
 }
 
 fn script_of(c: char) -> FallbackScript {
@@ -510,6 +566,10 @@ fn script_of(c: char) -> FallbackScript {
         | 0xFE30..=0xFE4F
         | 0xFF00..=0xFFEF
         | 0x20000..=0x3FFFF => FallbackScript::Han,
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x0870..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFE => FallbackScript::Arabic,
+        0x0590..=0x05FF | 0xFB1D..=0xFB4F => FallbackScript::Hebrew,
+        0x0900..=0x0DFF | 0xA8E0..=0xA8FF => FallbackScript::Indic,
+        0x0E00..=0x0E7F => FallbackScript::Thai,
         _ => FallbackScript::Other,
     }
 }
@@ -532,34 +592,91 @@ const JAPANESE_FAMILIES: &[&str] = &[
     "IPAGothic",
     "VL Gothic",
 ];
-const CHINESE_FAMILIES: &[&str] = &[
-    "Microsoft YaHei",
-    "Microsoft JhengHei",
-    "SimSun",
-    "MingLiU",
-    "PingFang SC",
-    "PingFang TC",
-    "Noto Sans CJK SC",
-    "Noto Sans CJK TC",
-    "Noto Sans SC",
-    "Noto Sans TC",
-    "Source Han Sans SC",
-    "Source Han Sans TC",
-    "WenQuanYi Micro Hei",
-];
+/// Han ideograph families for Simplified Chinese, in the order the platforms' own fallback tables
+/// prefer them (Windows, macOS, then the Linux/Noto names). Missing ones cost one name lookup each.
+const SIMPLIFIED_CHINESE_FAMILIES: &[&str] =
+    &["Microsoft YaHei", "SimSun", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "WenQuanYi Micro Hei"];
+/// The same for Traditional Chinese. The two scripts share almost all of their code points but not
+/// the glyph forms (`东` against `東`'s neighbours, `直`, `骨`), so one list for both drew a
+/// Traditional interface with Simplified forms - the faces do not differ in *coverage*, which is
+/// what the fallback search checks, so the script has to pick the list.
+const TRADITIONAL_CHINESE_FAMILIES: &[&str] =
+    &["Microsoft JhengHei", "MingLiU", "PingFang TC", "Heiti TC", "Hiragino Sans CNS", "Noto Sans CJK TC", "Noto Sans TC", "Source Han Sans TC"];
 const KOREAN_FAMILIES: &[&str] = &["Malgun Gothic", "Gulim", "Apple SD Gothic Neo", "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans KR", "NanumGothic"];
+/// The platforms' plain text families for the other scripts the bundled fonts lack, in the same
+/// order (Windows, macOS, then the Linux/Noto names).
+const ARABIC_FAMILIES: &[&str] = &["Segoe UI", "Tahoma", "Geeza Pro", "Noto Sans Arabic", "Noto Naskh Arabic", "DejaVu Sans", "Arial"];
+const HEBREW_FAMILIES: &[&str] = &["Segoe UI", "Tahoma", "Arial Hebrew", "Noto Sans Hebrew", "DejaVu Sans", "Arial"];
+const INDIC_FAMILIES: &[&str] = &[
+    "Nirmala UI",
+    "Kohinoor Devanagari",
+    "Kohinoor Bangla",
+    "Kohinoor Gujarati",
+    "Kohinoor Telugu",
+    "Devanagari Sangam MN",
+    "Bangla Sangam MN",
+    "Gurmukhi Sangam MN",
+    "Gujarati Sangam MN",
+    "Oriya Sangam MN",
+    "Tamil Sangam MN",
+    "Telugu Sangam MN",
+    "Kannada Sangam MN",
+    "Malayalam Sangam MN",
+    "Sinhala Sangam MN",
+    "Noto Sans Devanagari",
+    "Noto Sans Bengali",
+    "Noto Sans Gurmukhi",
+    "Noto Sans Gujarati",
+    "Noto Sans Oriya",
+    "Noto Sans Tamil",
+    "Noto Sans Telugu",
+    "Noto Sans Kannada",
+    "Noto Sans Malayalam",
+    "Noto Sans Sinhala",
+];
+const THAI_FAMILIES: &[&str] = &["Leelawadee UI", "Tahoma", "Thonburi", "Noto Sans Thai", "Noto Sans Thai UI", "Loma", "Garuda"];
 
-/// The CJK language to try first for Han ideographs, from the locale environment (`LANG`,
-/// `LC_ALL`, `LC_CTYPE`; `EFFECTCRAFT_CJK_LOCALE` overrides them). Japanese when nothing says
-/// otherwise: the ambiguity only matters for ideographs, and kana / hangul in the same text pick
-/// their language regardless.
-fn han_order() -> [FallbackScript; 3] {
-    let tag = ["EFFECTCRAFT_CJK_LOCALE", "LC_ALL", "LC_CTYPE", "LANG"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok())
-        .map(|v| v.trim().to_ascii_lowercase())
-        .find(|v| !v.is_empty() && v != "c" && v != "posix")
-        .unwrap_or_default();
+/// The CJK locale the host asked fallbacks to prefer, when it has one (see [`set_cjk_locale`]).
+static REQUESTED_CJK_LOCALE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Ask CJK font fallbacks to prefer `tag`'s language for Han ideographs instead of the locale
+/// environment, so a Chinese interface is drawn with a Chinese face on a machine whose locale is
+/// Japanese (and the other way round). The interface sets this from its language setting; an empty
+/// tag, `c` or `posix` clears the request and returns to the environment. Process-global, like the
+/// environment it replaces: every layout in the process follows it, so composition text is drawn
+/// with the same language's Han forms as the interface, not only the interface chrome.
+pub fn set_cjk_locale(tag: &str) {
+    let tag = tag.trim().to_ascii_lowercase();
+    let requested = if tag.is_empty() || tag == "c" || tag == "posix" { None } else { Some(tag) };
+    *REQUESTED_CJK_LOCALE.write().unwrap_or_else(|e| e.into_inner()) = requested;
+    // The order of the CJK families follows the language, so a change of language drops the cached
+    // fallbacks.
+    fallback_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+    family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn requested_cjk_locale() -> Option<String> {
+    REQUESTED_CJK_LOCALE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The CJK locale to use: [`set_cjk_locale`] when the host asked for one, otherwise the locale
+/// environment (`LANG`, `LC_ALL`, `LC_CTYPE`; `EFFECTCRAFT_CJK_LOCALE` overrides them).
+fn active_cjk_locale() -> String {
+    requested_cjk_locale().unwrap_or_else(|| {
+        ["EFFECTCRAFT_CJK_LOCALE", "LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .map(|v| v.trim().to_ascii_lowercase())
+            .find(|v| !v.is_empty() && v != "c" && v != "posix")
+            .unwrap_or_default()
+    })
+}
+
+/// The CJK language to try first for Han ideographs. Japanese when nothing says otherwise: the
+/// ambiguity only matters for ideographs, and kana / hangul in the same text pick their language
+/// regardless.
+fn han_order_for(tag: &str) -> [FallbackScript; 3] {
+    let tag = tag.trim().to_ascii_lowercase();
     if tag.starts_with("zh") {
         [FallbackScript::Han, FallbackScript::Japanese, FallbackScript::Korean]
     } else if tag.starts_with("ko") {
@@ -569,11 +686,39 @@ fn han_order() -> [FallbackScript; 3] {
     }
 }
 
+/// The order for the locale in force ([`active_cjk_locale`]).
+fn han_order() -> [FallbackScript; 3] {
+    han_order_for(&active_cjk_locale())
+}
+
+/// Whether a CJK tag asks for Traditional Chinese: a `Hant` script, or a Taiwan, Hong Kong or
+/// Macao region (`zh-TW`, `zh_HK`, `zh_MO.UTF-8`). Anything else Chinese - including a bare `zh` -
+/// is Simplified, as in the interface's own locale mapping.
+fn asks_traditional_chinese(tag: &str) -> bool {
+    tag.to_ascii_lowercase().split(['-', '_', '.']).any(|p| matches!(p, "hant" | "tw" | "hk" | "mo"))
+}
+
+/// The Chinese families to try first for `tag`: one list per script, since coverage does not tell
+/// the two apart - a Simplified face covers the Traditional glyphs' code points, so the fallback
+/// search would keep it and draw the wrong forms.
+fn chinese_families_for(tag: &str) -> &'static [&'static str] {
+    if asks_traditional_chinese(tag) { TRADITIONAL_CHINESE_FAMILIES } else { SIMPLIFIED_CHINESE_FAMILIES }
+}
+
+/// [`chinese_families_for`] for the locale in force ([`active_cjk_locale`]).
+fn chinese_families() -> &'static [&'static str] {
+    chinese_families_for(&active_cjk_locale())
+}
+
 fn families_for(s: FallbackScript) -> &'static [&'static str] {
     match s {
         FallbackScript::Japanese => JAPANESE_FAMILIES,
-        FallbackScript::Han => CHINESE_FAMILIES,
+        FallbackScript::Han => chinese_families(),
         FallbackScript::Korean => KOREAN_FAMILIES,
+        FallbackScript::Arabic => ARABIC_FAMILIES,
+        FallbackScript::Hebrew => HEBREW_FAMILIES,
+        FallbackScript::Indic => INDIC_FAMILIES,
+        FallbackScript::Thai => THAI_FAMILIES,
         FallbackScript::Other => &[],
     }
 }
@@ -586,33 +731,102 @@ fn file_covers(f: &Face, c: char) -> bool {
     }
     let FaceData::File(p) = &f.info.data else { return f.has_char(c) };
     let Ok(data) = std::fs::read(p) else { return false };
-    FontRef::from_index(&data, f.info.index).ok().and_then(|font| font.charmap().map(c)).is_some_and(|g| g.to_u32() != 0)
+    FontRef::from_index(&data, f.info.index).ok().is_some_and(|font| covers(&font, c))
 }
 
-/// Results of the expensive part of [`fallback_for`], per 256-character block and preferred face
-/// (so bold text gets the bold cut of the fallback family). `None` records that nothing installed
-/// covers the block, so the search over every font runs once per block, not once per character.
+/// Characters that legitimately draw nothing: whitespace and the default-ignorable code points
+/// (soft hyphen, joiners, bidi controls, variation selectors…).
+fn blank_by_nature(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(c as u32,
+            0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x200B..=0x200F
+            | 0x202A..=0x202E | 0x2060..=0x206F | 0x3164 | 0xFE00..=0xFE0F | 0xFEFF | 0xFFA0 | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A | 0xE0000..=0xE0FFF)
+}
+
+/// Whether `font` maps `c` to a glyph it can draw (see [`Face::has_char`]).
+fn covers(font: &FontRef, c: char) -> bool {
+    let Some(gid) = font.charmap().map(c).filter(|g| g.to_u32() != 0) else { return false };
+    blank_by_nature(c) || glyph_draws(font, gid)
+}
+
+/// Whether a glyph has an outline, a colour glyph or a bitmap in any strike.
+fn glyph_draws(font: &FontRef, gid: skrifa::GlyphId) -> bool {
+    use skrifa::outline::{DrawSettings, OutlinePen};
+    /// Counts the drawing segments of an outline.
+    struct Segments(usize);
+    impl OutlinePen for Segments {
+        fn move_to(&mut self, _: f32, _: f32) {}
+        fn line_to(&mut self, _: f32, _: f32) {
+            self.0 += 1;
+        }
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {
+            self.0 += 1;
+        }
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {
+            self.0 += 1;
+        }
+        fn close(&mut self) {}
+    }
+    if let Some(outline) = font.outline_glyphs().get(gid) {
+        let mut pen = Segments(0);
+        if outline.draw(DrawSettings::unhinted(Size::unscaled(), LocationRef::default()), &mut pen).is_ok() && pen.0 > 0 {
+            return true;
+        }
+    }
+    if font.color_glyphs().get(gid).is_some() {
+        return true;
+    }
+    let strikes = font.bitmap_strikes();
+    (0..strikes.len()).any(|i| strikes.get(i).is_some_and(|s| s.get(gid).is_some()))
+}
+
+/// Results of the search over every installed font in [`fallback_for`], per 256-character block and
+/// preferred face (so bold text gets the bold cut of the fallback family). `None` records that
+/// nothing installed covers the block, so the search over every font runs once per block, not once
+/// per character.
 fn fallback_cache() -> &'static RwLock<std::collections::HashMap<(u32, FaceId), Option<FaceId>>> {
     static CACHE: OnceLock<RwLock<std::collections::HashMap<(u32, FaceId), Option<FaceId>>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
-/// A face that covers `c`, preferring `prefer`. Bundled faces and faces already loaded are tried
-/// first (cheap); then, for CJK characters, the platform's usual family for that language, in the
-/// preferred face's style; then any installed face that covers the character. `prefer` when
-/// nothing does (the glyph renders as the missing-glyph box).
+/// The results of [`family_faces`], per script and preferred face.
+fn family_faces_cache() -> &'static RwLock<std::collections::HashMap<(FallbackScript, FaceId), Arc<Vec<FaceId>>>> {
+    static CACHE: OnceLock<RwLock<std::collections::HashMap<(FallbackScript, FaceId), Arc<Vec<FaceId>>>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// A face that covers `c`, preferring `prefer`. Bundled faces are tried first (cheap). For a
+/// character of a script with usual families (CJK, Arabic, Hebrew, Indic, Thai), the platform's
+/// usual families for that script are tried next, in the preferred face's style. Faces already
+/// loaded are tried after that (cheap), and any installed face that covers the character is tried
+/// last. `prefer` is returned when nothing covers it (the glyph renders as the missing-glyph box).
 pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
     let p = face(prefer);
     if p.has_char(c) || c.is_control() {
         return prefer;
     }
     let faces = all_faces();
-    // prefer a face of the same italic-ness that is bundled (cheap), then anything loaded already
+    // prefer a face of the same italic-ness that is bundled (cheap)
     for f in faces.iter().filter(|f| f.info.origin == "bundled") {
         if f.has_char(c) {
             return f.id;
         }
     }
+    // The usual families of the character's script come before the faces that are loaded already
+    // and before the search results of its block. Which faces are loaded depends on every earlier
+    // lookup, and Arial Unicode MS, the first face in the macOS scan, covers every script with
+    // usual families except Sinhala.
+    let script = script_of(c);
+    if script != FallbackScript::Other {
+        if cfg!(not(target_arch = "wasm32")) && !system_scanned() {
+            scan_system();
+        }
+        if let Some(&id) = family_faces(script, &p).iter().find(|&&id| face(id).has_char(c)) {
+            return id;
+        }
+    }
+    // Faces that are loaded already come next (cheap).
     for f in faces.iter().filter(|f| f.info.origin != "bundled" && f.bytes.get().is_some()) {
         if f.has_char(c) {
             return f.id;
@@ -634,29 +848,32 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
     found.unwrap_or(prefer)
 }
 
-/// The script-aware then exhaustive search behind [`fallback_for`].
-fn system_fallback(c: char, style: &str) -> Option<FaceId> {
-    let script = script_of(c);
+/// The script-aware part of [`fallback_for`]: the installed faces of the platform's usual families
+/// for `script`, in the order they are tried, each in the style of `prefer`. For CJK, the other CJK
+/// languages' families follow in the locale's order.
+fn family_faces(script: FallbackScript, prefer: &Face) -> Arc<Vec<FaceId>> {
+    if let Some(faces) = family_faces_cache().read().unwrap_or_else(|e| e.into_inner()).get(&(script, prefer.id)) {
+        return faces.clone();
+    }
     let order: Vec<FallbackScript> = match script {
         FallbackScript::Other => vec![],
         FallbackScript::Han => han_order().to_vec(),
-        s => {
+        s if s.is_cjk() => {
             let mut v = vec![s];
             v.extend(han_order().iter().copied().filter(|o| *o != s));
             v
         }
+        s => vec![s],
     };
-    for s in order {
-        for fam in families_for(s) {
-            if let Some(r) = resolve_in(fam, style)
-                && face(r.face).has_char(c)
-            {
-                return Some(r.face);
-            }
-        }
-    }
-    // Anything installed, in scan order; the style's weight and slant break ties among the faces
-    // of the first covering family.
+    let style = &prefer.info.style;
+    let faces: Arc<Vec<FaceId>> = Arc::new(order.into_iter().flat_map(families_for).filter_map(|fam| resolve_in(fam, style)).map(|r| r.face).collect());
+    family_faces_cache().write().unwrap_or_else(|e| e.into_inner()).insert((script, prefer.id), faces.clone());
+    faces
+}
+
+/// The exhaustive search behind [`fallback_for`]: anything installed, in scan order; the style's
+/// weight and slant break ties among the faces of the first covering family.
+fn system_fallback(c: char, style: &str) -> Option<FaceId> {
     let faces = all_faces();
     let first = faces.iter().find(|f| f.info.origin != "bundled" && file_covers(f, c))?;
     let r = resolve_in(&first.info.family, style)?;
@@ -666,6 +883,14 @@ fn system_fallback(c: char, style: &str) -> Option<FaceId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_font_dirs_come_from_a_path_list() {
+        assert!(extra_dirs(None).is_empty());
+        let v = std::env::join_paths(["/a/fonts", "/b/more"]).unwrap_or_default();
+        assert_eq!(extra_dirs(Some(&v)), vec![PathBuf::from("/a/fonts"), PathBuf::from("/b/more")]);
+        assert!(extra_dirs(Some(std::ffi::OsStr::new(""))).is_empty());
+    }
 
     #[test]
     fn bundled_families_and_resolution() {
@@ -750,7 +975,33 @@ mod tests {
         assert_eq!(script_of('Ａ'), FallbackScript::Han);
         assert_eq!(script_of('\u{20000}'), FallbackScript::Han);
         assert_eq!(script_of('A'), FallbackScript::Other);
-        assert_eq!(script_of('\u{5d0}'), FallbackScript::Other);
+        assert_eq!(script_of('م'), FallbackScript::Arabic);
+        assert_eq!(script_of('\u{fefb}'), FallbackScript::Arabic);
+        assert_eq!(script_of('\u{5d0}'), FallbackScript::Hebrew);
+        assert_eq!(script_of('क'), FallbackScript::Indic);
+        assert_eq!(script_of('த'), FallbackScript::Indic);
+        assert_eq!(script_of('ก'), FallbackScript::Thai);
+        assert_eq!(script_of('\u{feff}'), FallbackScript::Other, "the byte order mark is no Arabic letter");
+    }
+
+    /// Native: Arabic, Hebrew, Indic and Thai text in a Latin-only family falls back to the
+    /// platform's plain text family for its script (#394), not to the first installed face that
+    /// covers it (on Windows a calligraphic Arabic face sorts first). Skipped per script where no
+    /// family from its list is installed.
+    #[test]
+    fn other_scripts_fall_back_to_a_plain_system_family() {
+        scan_system();
+        let inter = resolve("Inter", "Regular").face;
+        for (c, families) in [('م', ARABIC_FAMILIES), ('א', HEBREW_FAMILIES), ('क', INDIC_FAMILIES), ('த', INDIC_FAMILIES), ('ก', THAI_FAMILIES)] {
+            let covering = families.iter().any(|n| resolve_in(n, "Regular").is_some_and(|r| face(r.face).has_char(c)));
+            if !covering {
+                eprintln!("{c}: no family from the list is installed; skipping");
+                continue;
+            }
+            let f = face(fallback_for(c, inter));
+            assert!(f.has_char(c), "{c}: {} lacks it", f.info.family);
+            assert!(families.iter().any(|n| f.info.family.eq_ignore_ascii_case(n)), "{c} → {}", f.info.family);
+        }
     }
 
     /// Native: Japanese text in a Latin-only family falls back to an installed Japanese family
@@ -778,6 +1029,132 @@ mod tests {
         assert!(!has_bold || w >= 600, "{} {}", f.info.family, f.info.style);
         // Cached: the second call is a lookup.
         assert_eq!(fallback_for('水', inter), f.id);
+    }
+
+    /// A minimal TrueType font built in code (no font file in the repo): U+0020 and U+E000 map to
+    /// an empty glyph, U+E001 to a triangle.
+    fn blank_glyph_font() -> Vec<u8> {
+        fn u16s(v: &[u16]) -> Vec<u8> {
+            v.iter().flat_map(|x| x.to_be_bytes()).collect()
+        }
+        let delta_space = 1u16.wrapping_sub(0x20);
+        let cmap4 = {
+            let mut t = u16s(&[4, 0, 0, 6, 4, 1, 2]);
+            t.extend(u16s(&[0x20, 0xE001, 0xFFFF, 0, 0x20, 0xE000, 0xFFFF, delta_space, 0x2001, 1, 0, 0, 0]));
+            let len = t.len() as u16;
+            t[2..4].copy_from_slice(&len.to_be_bytes());
+            t
+        };
+        let mut cmap = u16s(&[0, 1, 3, 1, 0, 12]);
+        cmap.extend(cmap4);
+        // glyph 2: one contour of three on-curve points (100,0) (500,0) (300,600)
+        let mut glyf = u16s(&[1, 100, 0, 500, 600, 2, 0]);
+        glyf.extend([1u8, 1, 1]);
+        glyf.extend(u16s(&[100, 400, (-200i16) as u16, 0, 0, 600]));
+        glyf.push(0);
+        let loca = u16s(&[0, 0, 0, (glyf.len() / 2) as u16]);
+        let mut head = u16s(&[1, 0, 1, 0, 0, 0, 0x5F0F, 0x3CF5, 0, 1000]);
+        head.extend([0u8; 16]);
+        head.extend(u16s(&[100, 0, 500, 600, 0, 8, 2, 0, 0]));
+        let mut hhea = u16s(&[1, 0, 800, (-200i16) as u16, 0, 600, 0, 0, 500, 1, 0, 0]);
+        hhea.extend([0u8; 8]);
+        hhea.extend(u16s(&[0, 3]));
+        let hmtx = u16s(&[600, 0, 600, 0, 600, 0]);
+        let maxp = u16s(&[1, 0, 3, 3, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let strings: Vec<Vec<u8>> = ["Blank Glyph Test", "Regular"].iter().map(|s| s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()).collect();
+        let mut name = u16s(&[0, 2, 30]);
+        let mut off = 0;
+        for (id, st) in strings.iter().enumerate() {
+            name.extend(u16s(&[3, 1, 0x409, id as u16 + 1, st.len() as u16, off]));
+            off += st.len() as u16;
+        }
+        strings.iter().for_each(|st| name.extend(st));
+        let tables: [(&[u8; 4], Vec<u8>); 8] =
+            [(b"cmap", cmap), (b"glyf", glyf), (b"head", head), (b"hhea", hhea), (b"hmtx", hmtx), (b"loca", loca), (b"maxp", maxp), (b"name", name)];
+        let mut out = u16s(&[1, 0, tables.len() as u16, 128, 3, 0]);
+        let mut offset = 12 + 16 * tables.len();
+        let mut body = vec![];
+        for (tag, data) in &tables {
+            out.extend(*tag);
+            out.extend([0u8; 4]);
+            out.extend((offset as u32).to_be_bytes());
+            out.extend((data.len() as u32).to_be_bytes());
+            let padded = data.len().div_ceil(4) * 4;
+            body.extend(data);
+            body.resize(body.len() + padded - data.len(), 0);
+            offset += padded;
+        }
+        out.extend(body);
+        out
+    }
+
+    /// A face that maps a character to an empty glyph doesn't cover it, so fallback skips it
+    /// (#285); a blank space still counts, and a drawn glyph is found as before.
+    #[test]
+    fn an_empty_glyph_does_not_cover_its_character() {
+        let ids = add_font_data(blank_glyph_font());
+        let &[id] = ids.as_slice() else { panic!("one face expected: {ids:?}") };
+        let f = face(id);
+        assert_eq!(f.info.family, "Blank Glyph Test");
+        assert!(f.glyph('\u{e000}').is_some(), "the cmap maps it");
+        assert!(!f.has_char('\u{e000}'), "but its glyph is empty");
+        assert!(f.has_char('\u{e001}'), "a drawn glyph covers its character");
+        assert!(f.has_char(' '), "a space is blank by nature");
+        let inter = resolve("Inter", "Regular").face;
+        assert_ne!(fallback_for('\u{e000}', inter), id, "fallback never picks the empty glyph");
+        assert_eq!(fallback_for('\u{e001}', inter), id, "fallback finds the drawn one");
+    }
+
+    #[test]
+    fn the_han_order_follows_the_cjk_locale() {
+        // Chinese first for any Chinese tag, whether or not it names a script.
+        for tag in ["zh", "zh-CN", "zh_Hans", "ZH-Hant-TW.UTF-8", "zh_MO"] {
+            assert_eq!(han_order_for(tag)[0], FallbackScript::Han, "{tag}");
+        }
+        assert_eq!(han_order_for("ko-KR"), [FallbackScript::Korean, FallbackScript::Japanese, FallbackScript::Han]);
+        // Japanese, and anything else, keeps the Japanese face first for Han text.
+        for tag in ["ja_JP.UTF-8", "en-US", "de", ""] {
+            assert_eq!(han_order_for(tag), [FallbackScript::Japanese, FallbackScript::Han, FallbackScript::Korean], "{tag}");
+        }
+        // The host's request is what `han_order` reads (the ui test covers the effect on the
+        // registered fallbacks; this only checks that clearing it returns to the environment).
+        assert_eq!(requested_cjk_locale(), None, "tests run without a request");
+        assert_eq!(han_order(), han_order_for(&active_cjk_locale()));
+    }
+
+    #[test]
+    fn the_chinese_family_list_follows_the_script_the_locale_asks_for() {
+        for tag in ["zh", "zh-CN", "zh_Hans", "zh_CN.UTF-8", "zh-SG"] {
+            assert_eq!(chinese_families_for(tag), SIMPLIFIED_CHINESE_FAMILIES, "{tag}");
+        }
+        for tag in ["zh-Hant", "zh-Hant-TW", "zh_TW", "zh-HK", "zh_MO.UTF-8"] {
+            assert_eq!(chinese_families_for(tag), TRADITIONAL_CHINESE_FAMILIES, "{tag}");
+        }
+        // Each list carries its own script's faces and not the other's, which is the point of
+        // splitting them: `PingFang SC` covers the same code points as `PingFang TC`, so the
+        // fallback search would have kept it and drawn Simplified forms in a Traditional interface.
+        assert!(SIMPLIFIED_CHINESE_FAMILIES.iter().any(|f| f.contains("PingFang SC") && !f.contains("Source")));
+        assert!(!SIMPLIFIED_CHINESE_FAMILIES.iter().any(|f| f.contains("TC") || f.contains("JhengHei")));
+        assert!(TRADITIONAL_CHINESE_FAMILIES.iter().any(|f| f.contains("PingFang TC")));
+        assert!(!TRADITIONAL_CHINESE_FAMILIES.iter().any(|f| f.contains(" SC") || f.contains("YaHei") || f.contains("WenQuanYi")));
+        assert!(TRADITIONAL_CHINESE_FAMILIES.iter().any(|f| f.contains("Heiti TC") || f.contains("Hiragino Sans CNS")));
+        // The arm the fallback itself walks: Han hands over the list the locale's script picked.
+        assert_eq!(families_for(FallbackScript::Han), chinese_families_for(&active_cjk_locale()));
+        // Han text is the only thing these lists serve; the Japanese order does not change.
+        assert_eq!(han_order_for("ja_JP.UTF-8")[0], FallbackScript::Japanese);
+    }
+
+    #[test]
+    fn bundled_ui_fonts_cover_the_ukrainian_alphabet() {
+        const ALPHABET: &str = "АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯабвгґдеєжзиіїйклмнопрстуфхцчшщьюя’«»";
+        for (name, bytes) in
+            [("Inter Regular", INTER_REGULAR), ("Inter Medium", INTER_MEDIUM), ("Inter SemiBold", INTER_SEMIBOLD), ("JetBrains Mono", JETBRAINS_MONO_REGULAR)]
+        {
+            let font = FontRef::new(bytes).unwrap();
+            for c in ALPHABET.chars() {
+                assert!(covers(&font, c), "{name} cannot draw {c}");
+            }
+        }
     }
 
     #[test]

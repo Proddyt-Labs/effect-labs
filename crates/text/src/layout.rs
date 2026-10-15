@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use harfrust::{Direction, Feature, Tag, UnicodeBuffer};
 use unicode_bidi::{BidiInfo, Level};
 
-use effectcraft_keyframe::OpenType;
+use effectcraft_keyframe::{OpenType, text_doc::paragraph_ranges};
 
 use crate::fonts::{self, FaceId, Resolved};
 
@@ -88,6 +88,8 @@ pub struct TextStyle {
     /// Variable font axis values (tag, user units): shaping (advances through HVAR / gvar
     /// phantom points) and outlines use this design-space position.
     pub variations: Vec<(String, f32)>,
+    /// Use vertical alternates for upright CJK glyphs (runtime layout setting only).
+    pub vertical: bool,
 }
 
 impl Default for TextStyle {
@@ -113,6 +115,7 @@ impl Default for TextStyle {
             leading: None,
             opentype: OpenType::default(),
             variations: Vec::new(),
+            vertical: false,
         }
     }
 }
@@ -198,6 +201,7 @@ impl Hash for TextStyle {
         self.leading.map(f32::to_bits).hash(h);
         (self.kerning, self.optical, self.ligatures, self.faux_bold, self.faux_italic, self.caps, self.underline, self.script).hash(h);
         self.opentype.hash(h);
+        self.vertical.hash(h);
         for (t, v) in &self.variations {
             t.hash(h);
             hf(h, *v);
@@ -450,6 +454,10 @@ fn shape_item(chars: &[(usize, char, char)], rtl: bool, face: FaceId, size: f32,
     buf.set_direction(if rtl { Direction::RightToLeft } else { Direction::LeftToRight });
     buf.guess_segment_properties();
     let mut feats = Vec::new();
+    if style.vertical && chars.first().is_some_and(|(_, c, _)| crate::is_cjk(*c)) {
+        feats.push(Feature::new(Tag::new(b"vert"), 1, ..));
+        feats.push(Feature::new(Tag::new(b"vrt2"), 1, ..));
+    }
     if !style.kerning || style.optical || style.manual_kern.is_some() {
         feats.push(Feature::new(Tag::new(b"kern"), 0, ..));
     }
@@ -666,13 +674,14 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
     let mut items: Vec<Item> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        let key = |c: &(usize, char, char, FaceId, bool, Form, usize)| (c.3, c.4, c.5, c.6);
+        let key =
+            |c: &(usize, char, char, FaceId, bool, Form, usize)| (c.3, c.4, c.5, c.6, runs.get(c.6).is_some_and(|run| run.1.vertical) && crate::is_cjk(c.1));
         let k0 = key(&chars[i]);
         let mut j = i + 1;
         while j < chars.len() && key(&chars[j]) == k0 {
             j += 1;
         }
-        let (face, rtl, form, si) = k0;
+        let (face, rtl, form, si, _) = k0;
         let style = &runs[si].1;
         let sub: Vec<(usize, char, char)> = chars[i..j].iter().map(|c| (c.0, c.1, c.2)).collect();
         let size = match form {
@@ -931,13 +940,13 @@ fn paragraph(text: &str, base: usize, runs: &[(Range<usize>, TextStyle)], primar
     out
 }
 
-/// Lay out `text` (paragraphs separated by `\n`) in one style.
+/// Lay out `text` (paragraphs separated by CR, LF or CRLF) in one style.
 pub fn layout_uncached(text: &str, style: &TextStyle, para: &ParagraphStyle) -> Layout {
     layout_rich_uncached(text, &[(0..text.len(), style.clone())], std::slice::from_ref(para))
 }
 
 /// Lay out `text` with character style runs (byte ranges covering the text, in order; at least
-/// one) and paragraph settings (one per `\n`-separated paragraph; the last repeats). The wrap
+/// one) and paragraph settings (one per CR/LF/CRLF-separated paragraph; the last repeats). The wrap
 /// width is the first paragraph's.
 pub fn layout_rich_uncached(text: &str, runs: &[(Range<usize>, TextStyle)], paras: &[ParagraphStyle]) -> Layout {
     let fallback = [(0..text.len(), TextStyle::default())];
@@ -947,12 +956,10 @@ pub fn layout_rich_uncached(text: &str, runs: &[(Range<usize>, TextStyle)], para
     let width = para_at(0).width;
     let primaries: Vec<Resolved> = runs.iter().map(|(_, s)| fonts::resolve(&s.family, &s.style)).collect();
     let mut lay = Layout { missing_font: primaries.iter().any(|p| p.missing), text_len: text.len(), ..Default::default() };
-    let mut base = 0usize;
     let mut plines: Vec<(usize, ParaLine)> = Vec::new();
-    for (pi, p) in text.split('\n').enumerate() {
-        let p_clean = p.strip_suffix('\r').unwrap_or(p);
-        plines.extend(paragraph(p_clean, base, runs, &primaries, para_at(pi), width).into_iter().map(|l| (pi, l)));
-        base += p.len() + 1;
+    for (pi, span) in paragraph_ranges(text).enumerate() {
+        let p = text.get(span.bytes.clone()).unwrap_or_default();
+        plines.extend(paragraph(p, span.bytes.start, runs, &primaries, para_at(pi), width).into_iter().map(|l| (pi, l)));
     }
     let mut baseline = 0.0f32;
     for (i, (pi, pl)) in plines.into_iter().enumerate() {

@@ -10,7 +10,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+<<<<<<< HEAD
 labs-updater = { version = "0.1.0", path = "../labs-updater" }
+=======
+craft-ui = { workspace = true }
+>>>>>>> upstream/main
 effectcraft-time = { workspace = true }
 effectcraft-geom = { workspace = true }
 effectcraft-color = { workspace = true }
@@ -31,7 +35,15 @@ web-time = { workspace = true }
 kurbo = { workspace = true }
 image = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sys-locale = { workspace = true }
+
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
 pollster = "0.4"
 effectcraft-host = { workspace = true }
+exr = { workspace = true }
+
+[build-dependencies]
+serde_json = { workspace = true }
+toml = "1"

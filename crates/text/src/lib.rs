@@ -7,6 +7,8 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
+mod font_dirs;
 pub mod fonts;
 pub mod layout;
 pub mod path_text;
@@ -168,6 +170,7 @@ pub fn text_style(s: &CharStyle) -> TextStyle {
         leading: s.leading.map(|l| l as f32),
         opentype: s.opentype,
         variations: s.variations.clone(),
+        vertical: false,
     }
 }
 
@@ -227,7 +230,9 @@ pub fn layout_doc(doc: &TextDoc) -> TextLayout {
         let a = byte_of_char[ci.min(nchars)];
         ci += r.len;
         let b = byte_of_char[ci.min(nchars)];
-        runs.push((a..b, text_style(&r.style)));
+        let mut runtime_style = text_style(&r.style);
+        runtime_style.vertical = doc.vertical && !r.style.tate_chu_yoko;
+        runs.push((a..b, runtime_style));
         styles.push(r.style);
     }
     let width = doc.box_size.map(|b| if doc.vertical { b[1] } else { b[0] } as f32);
@@ -308,10 +313,17 @@ pub fn layout_doc(doc: &TextDoc) -> TextLayout {
             } else if doc.vertical {
                 let upright = is_cjk(src) || st.is_some_and(|s| s.vertical_roman_upright);
                 if upright {
-                    // Keep the character upright around its centre.
-                    let c = Point::new(advance / 2.0, -0.35 * g.size as f64);
-                    let rc = ROT90 * c;
-                    let t = Affine::translate((rc.x - c.x, rc.y - c.y));
+                    // Anchor vertical forms using their own vertical origin and horizontal
+                    // advance, not the next glyph's pen (which includes tracking/justification).
+                    let font = fonts::face(g.face);
+                    let metrics = is_cjk(src).then(|| font.vertical_origin(g.id, g.size)).flatten();
+                    let t = if let Some((width, top)) = metrics {
+                        Affine::translate((0.35 * g.size as f64 - width * g.h_scale as f64 / 2.0, top * g.v_scale as f64))
+                    } else {
+                        let c = Point::new(advance / 2.0, -0.35 * g.size as f64);
+                        let rc = ROT90 * c;
+                        Affine::translate((rc.x - c.x, rc.y - c.y))
+                    };
                     path = t * path;
                     outline_xf = t * outline_xf;
                 } else {
@@ -434,6 +446,65 @@ pub fn char_glyph(doc: &TextDoc, ch: char) -> (BezPath, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1063 (item 8): After Effects scripts use CR for Source Text line breaks.
+    #[test]
+    fn carriage_returns_create_lines_without_rewriting_source_text() {
+        let lf = TextDoc::plain("Line 1\nLine 2");
+        let cr = TextDoc::plain("Line 1\rLine 2");
+        let expected = layout_doc(&lf);
+        let actual = layout_doc(&cr);
+        assert_eq!(actual.lines, 2);
+        assert_eq!(actual.bounds, expected.bounds);
+        assert_eq!(actual.line_boxes, expected.line_boxes);
+        assert_eq!(cr.text, "Line 1\rLine 2");
+        assert_eq!(actual.chars, cr.char_len());
+    }
+
+    #[test]
+    fn line_break_variants_match_in_point_box_and_vertical_text() {
+        for vertical in [false, true] {
+            for boxed in [false, true] {
+                let template = TextDoc { size: 30.0, vertical, box_size: boxed.then_some([120.0, 120.0]), ..Default::default() };
+                let expected = layout_doc(&TextDoc { text: "one two three\n\nshort\n".into(), ..template.clone() });
+                for separator in ["\r", "\r\n", "\n"] {
+                    let text = format!("one two three{separator}{separator}short{separator}");
+                    let doc = TextDoc { text: text.clone(), ..template.clone() };
+                    let actual = layout_doc(&doc);
+                    assert_eq!(actual.lines, expected.lines, "{separator:?}, boxed={boxed}, vertical={vertical}");
+                    assert_eq!(actual.bounds, expected.bounds);
+                    assert_eq!(actual.line_boxes, expected.line_boxes);
+                    assert_eq!(doc.text, text);
+                    assert_eq!(actual.chars, doc.char_len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crlf_preserves_unicode_style_indices_and_paragraph_formatting() {
+        for separator in ["\r", "\n", "\r\n"] {
+            let text = format!("é{separator}Beta");
+            let mut doc = TextDoc::plain(&text);
+            let start = 1 + separator.chars().count();
+            doc.apply_style(start..doc.char_len(), |s| {
+                s.size = 80.0;
+                s.fill = [0.0, 1.0, 0.0, 1.0];
+            });
+            doc.apply_para(start..start + 1, |p| p.indent_left = 30.0);
+            let layout = layout_doc(&doc);
+            assert_eq!(layout.lines, 2);
+            let glyph = layout.glyphs.iter().find(|g| g.ch == 'B').unwrap();
+            assert_eq!(glyph.char_index, start);
+            assert_eq!(glyph.line_index, 1);
+            assert_eq!(glyph.size, 80.0);
+            assert_eq!(layout.styles[glyph.run].fill, [0.0, 1.0, 0.0, 1.0]);
+            assert_eq!(layout.line_span(start), (start, doc.char_len()));
+            assert_eq!(layout.char_of_byte(doc.byte_of(start)), start);
+            assert_eq!(doc.paras().iter().map(|p| p.indent_left).collect::<Vec<_>>(), vec![0.0, 30.0]);
+            assert_eq!(doc.text, text);
+        }
+    }
 
     #[test]
     fn layout_counts_and_bounds() {

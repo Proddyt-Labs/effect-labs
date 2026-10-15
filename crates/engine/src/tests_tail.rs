@@ -304,7 +304,7 @@ fn variable_font_axes_animator() {
         eprintln!("the variable face isn't reachable by family/style: skipped");
         return;
     }
-    let tag = listed["axes"][0]["tag"].as_str().unwrap().to_string();
+    let tag = axis.tag.clone();
     let r = s.execute("text.animatorFontAxes", json!({"axis": tag})).unwrap();
     let anim = r["animator"].as_u64().unwrap();
     let area = |s: &Session| {
@@ -327,7 +327,8 @@ fn variable_font_axes_animator() {
     let gap_before = gap(&s);
     let l = s.active_comp().unwrap().layer(LayerId(t)).unwrap().clone();
     let pg = l.props.find_group(anim).unwrap().sub("properties").unwrap().props().next().unwrap().uid;
-    let range = (axis.max - axis.min) as f64;
+    let target = if axis.max - axis.default >= axis.default - axis.min { axis.max } else { axis.min };
+    let range = (target - axis.default) as f64;
     s.execute("prop.set", json!({"layer": t, "prop": pg, "value": range})).unwrap();
     let after = area(&s);
     assert!((after - before).abs() > 1.0, "{} axis moved the outline: {before} → {after}", axis.tag);
@@ -337,7 +338,7 @@ fn variable_font_axes_animator() {
     let gid = f.glyph('H').unwrap();
     let upem = f.units_per_em() as f64;
     let units = |v: f32| effectcraft_text::variable::advance_units_at(face, gid, &[(a.tag.clone(), v)]).unwrap() as f64;
-    let want = (units((a.default + range as f32).min(a.max)) - units(a.default)) * 60.0 / upem;
+    let want = (units((a.default + range as f32).clamp(a.min, a.max)) - units(a.default)) * 60.0 / upem;
     let moved = gap(&s) - gap_before;
     assert!((moved - want).abs() < 0.5, "{} axis: advance change {moved}, expected {want}", a.tag);
     s.execute("edit.undo", json!({})).unwrap();
@@ -418,4 +419,30 @@ fn camera_focus_commands_undo_and_serde() {
     s.execute("layer.select", json!({"layers": [cam]})).unwrap();
     assert!(s.execute("camera.linkFocusToLayer", json!({})).is_err());
     assert!(s.execute("camera.linkFocusToPoi", json!({})).is_ok());
+}
+
+/// An id sent as a string (`"98"`, as MCP clients often do) resolves as an id when no name matches.
+#[test]
+fn numeric_string_resolves_as_id() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "T", "width": 320, "height": 180, "duration": 2.0, "frameRate": 30})).unwrap();
+    let l = s.execute("layer.newSolid", json!({"color": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+    let cid = s.active_comp_id().unwrap();
+    assert_eq!(s.resolve_comp(Some(&json!(cid.0.to_string()))).unwrap(), cid);
+    assert!(s.resolve_comp(Some(&json!("999999"))).is_err());
+    let comp = s.project.comp(cid).unwrap();
+    assert_eq!(crate::commands::resolve_layer(comp, &json!(l.to_string())), Some(LayerId(l)));
+    assert_eq!(crate::commands::resolve_layer(comp, &json!("999999")), None);
+    let r = s.execute("layer.tree", json!({"layer": l.to_string(), "comp": cid.0.to_string()})).unwrap();
+    assert_eq!(r["id"].as_u64(), Some(l), "{r}");
+}
+
+/// Go to Work Area Start / End have After Effects' default keys (Shift+Home / Shift+End).
+#[test]
+fn work_area_navigation_has_after_effects_default_keys() {
+    let s = Session::default();
+    for (id, key) in [("time.workAreaStart", "Shift+Home"), ("time.workAreaEnd", "Shift+End")] {
+        let b = s.shortcuts().find(id).unwrap_or_else(|| panic!("{id} is bindable"));
+        assert_eq!(b.defaults, [key.to_string()], "{id}");
+    }
 }

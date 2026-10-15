@@ -106,6 +106,31 @@ fn new_light_and_change_type() {
     assert!(s.execute("layer.newLight", json!({"kind": "Laser"})).is_err());
 }
 
+/// The Environment light is listed in `layer.newLight`'s help and in the kind errors, and takes
+/// its equirectangular source as a layer id (#261).
+#[test]
+fn environment_light_is_listed_and_takes_a_source_layer() {
+    let mut s = session();
+    let spec = crate::command_specs().iter().find(|c| c.id == "layer.newLight").unwrap();
+    assert!(spec.params.contains("lightOptions/source"), "{}", spec.params);
+    let e = s.execute("layer.newLight", json!({"kind": "Laser"})).unwrap_err().to_string();
+    let point = s.execute("layer.newLight", json!({"kind": "Point"})).unwrap()["layer"].as_u64().unwrap();
+    let e2 = s.execute("layer.lightSettings", json!({"layer": point, "kind": "Laser"})).unwrap_err().to_string();
+    for k in LightKind::ALL {
+        assert!(spec.params.contains(k.label()), "help lists {}: {}", k.label(), spec.params);
+        assert!(e.contains(k.label()) && e2.contains(k.label()), "{e} / {e2}");
+    }
+    let sky = s.execute("layer.newSolid", json!({"width": 256, "height": 128, "name": "Sky"})).unwrap()["layer"].as_u64().unwrap();
+    let env = s.execute("layer.newLight", json!({"kind": "Environment", "name": "Env"})).unwrap()["layer"].as_u64().unwrap();
+    let source = s.active_comp().unwrap().layer(effectcraft_project::LayerId(env)).unwrap().source.clone();
+    assert_eq!(source, LayerSource::Light { kind: LightKind::Environment });
+    assert_eq!(prop(&s, env, "lightOptions/source").as_layer(), None, "empty: the comp's Environment Layer");
+    s.execute("prop.set", json!({"layer": env, "path": "lightOptions/source", "value": sky})).unwrap();
+    assert_eq!(prop(&s, env, "lightOptions/source").as_layer(), Some(sky));
+    s.undo();
+    assert_eq!(prop(&s, env, "lightOptions/source").as_layer(), None);
+}
+
 #[test]
 fn three_d_switch_undo_redo() {
     let mut s = session();
@@ -217,4 +242,26 @@ fn demo_has_3d_showcase() {
         s.render(cid, effectcraft_time::Tick::from_seconds_f64(4.0), effectcraft_render::RenderOpts { scale: 0.125, motion_blur: false, ..Default::default() });
     let lit = img.data.iter().filter(|p| p[3] > 0.99 && p[0] + p[1] + p[2] > 0.3).count();
     assert!(lit > 2_000, "{lit}");
+}
+
+/// #670: the views of the panes of a multi-view layout are chosen per pane, kept per comp, and
+/// editor states saved before panes existed load with the default Top / Front / Right.
+#[test]
+fn layout_panes_choose_their_view() {
+    use effectcraft_render::three_d::{View3D, Views3D};
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "C", "width": 640, "height": 360, "duration": 2})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    assert_eq!(s.state.views3d.get(&cid).cloned().unwrap_or_default().pane(0), View3D::Top);
+    let r = s.execute("view.setPaneView", json!({"pane": 2, "view": "bottom"})).unwrap();
+    assert_eq!(r["views"], json!(["activeCamera", "top", "bottom", "right"]));
+    assert_eq!(s.state.views3d[&cid].current, View3D::ActiveCamera, "the main view is untouched");
+    s.execute("view.setPaneView", json!({"pane": 0, "view": "custom1"})).unwrap();
+    assert_eq!(s.state.views3d[&cid].current, View3D::Custom1);
+    assert!(s.execute("view.setPaneView", json!({"pane": 4, "view": "top"})).is_err());
+    assert!(s.execute("view.setPaneView", json!({"pane": 1, "view": "nope"})).is_err());
+    let back: crate::EditorState = serde_json::from_value(serde_json::to_value(&s.state).unwrap()).unwrap();
+    assert_eq!(back.views3d[&cid].pane(1), View3D::Bottom);
+    let old: Views3D = serde_json::from_value(json!({"current": "Front"})).unwrap();
+    assert_eq!((old.current, old.pane(0), old.pane(1), old.pane(2)), (View3D::Front, View3D::Top, View3D::Front, View3D::Right));
 }

@@ -151,6 +151,44 @@ fn renderer_switch_adds_geometry_options() {
     assert_eq!(layer(&s, t).props.prop("geometryOptions/extrusionDepth").unwrap().value.as_f64(), 40.0);
 }
 
+/// Contents ▸ Add ▸ Front / Bevel / Side / Back ▸ Color (#315): one surface item per group,
+/// reused by later adds, one undo step each; text gets the same as animator properties.
+#[test]
+fn surface_colors_for_extruded_shapes_and_text() {
+    let mut s = session();
+    s.execute("comp.renderer", json!({"renderer": "advanced3d"})).unwrap();
+    let sh = s.execute("layer.newShape", json!({})).unwrap()["layer"].as_u64().unwrap();
+    let r = s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "sideColor"})).unwrap();
+    assert_eq!(r["path"], "contents/side");
+    let side = r["uid"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": sh, "path": "contents/side/color", "value": [0.0, 1.0, 0.0, 1.0]})).unwrap();
+    // Adding Side ▸ Color again reuses the item (and keeps its colour).
+    assert_eq!(s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "sideColor"})).unwrap()["uid"].as_u64(), Some(side));
+    let l = layer(&s, sh);
+    let contents = l.props.sub("contents").unwrap();
+    assert_eq!(contents.groups().filter(|g| g.match_id == "side").count(), 1);
+    assert_eq!(l.props.prop("contents/side/color").unwrap().value, KV::Color([0.0, 1.0, 0.0, 1.0]));
+    // Into a shape group.
+    s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "group"})).unwrap();
+    let r = s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "frontColor", "group": "contents/group"})).unwrap();
+    assert_eq!(r["path"], "contents/group/contents/front");
+    assert!(s.execute("layer.addShapeItem", json!({"layer": sh, "kind": "sideShininess"})).is_err());
+    s.undo();
+    assert!(layer(&s, sh).props.group("contents/group/contents/front").is_none());
+    let cid = s.active_comp_id().unwrap();
+    s.execute("prop.set", json!({"layer": sh, "path": "geometryOptions/extrusionDepth", "value": 40})).unwrap();
+    let _ = s.render(cid, s.time(), Default::default());
+    // Text: Animate ▸ Front / Bevel / Side / Back ▸ Color.
+    let t = s.execute("layer.newText", json!({"text": "Hi"})).unwrap()["layer"].as_u64().unwrap();
+    for k in ["frontColor", "bevelColor", "sideColor", "backColor"] {
+        s.execute("layer.addTextAnimator", json!({"layer": t, "property": k})).unwrap();
+    }
+    let l = layer(&s, t);
+    assert!(l.props.prop("text/animators/#3/properties/sideColor").is_some());
+    s.execute("prop.set", json!({"layer": t, "path": "geometryOptions/extrusionDepth", "value": 20})).unwrap();
+    let _ = s.render(cid, s.time(), Default::default());
+}
+
 #[test]
 fn environment_layer_toggle() {
     let mut s = session();
@@ -192,4 +230,51 @@ fn material_commands_and_serde() {
     let json = s.project.to_json();
     let back = Project::from_json(&json).unwrap();
     assert_eq!(&back, &*s.project);
+}
+
+/// #264: only Advanced 3D draws models and primitives, and new comps are Classic 3D, so an
+/// imported model was invisible. Adding one switches the comp to Advanced 3D (in the same undo
+/// step, with a toast), as After Effects does.
+#[test]
+fn adding_models_switches_classic_comps_to_advanced_3d() {
+    let toasts = |s: &mut Session| -> Vec<String> {
+        s.drain_events().into_iter().filter_map(|e| if let crate::Event::Toast { message, .. } = e { Some(message) } else { None }).collect()
+    };
+    let mut s = session();
+    let text = s.execute("layer.newText", json!({"text": "Hi"})).unwrap()["layer"].as_u64().unwrap();
+    let item = s.execute("file.import", json!({"paths": [fixture("quad.glb")]})).unwrap()["items"][0].as_u64().unwrap();
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Classic3D);
+    toasts(&mut s);
+    let r = s.execute("layer.addItem", json!({"item": item})).unwrap();
+    assert_eq!(r["advanced3d"], true);
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Advanced3D);
+    // As with Composition Settings: the text layer gets Geometry Options.
+    assert!(layer(&s, text).props.sub("geometryOptions").is_some());
+    assert!(toasts(&mut s).iter().any(|m| m.contains("Advanced 3D")));
+    // A second model leaves the comp (and the user) alone.
+    s.execute("layer.addItem", json!({"item": item})).unwrap();
+    assert!(toasts(&mut s).is_empty());
+    s.undo();
+    s.undo();
+    assert_eq!(s.active_comp().unwrap().layers.len(), 1);
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Classic3D);
+    assert!(layer(&s, text).props.sub("geometryOptions").is_none());
+    // Primitives too.
+    s.execute("layer.newPrimitive", json!({"kind": "cube"})).unwrap();
+    assert_eq!(s.active_comp().unwrap().renderer, Renderer::Advanced3D);
+    // Switching back to Classic 3D says why the model layers disappear.
+    toasts(&mut s);
+    s.execute("comp.renderer", json!({"renderer": "classic3d"})).unwrap();
+    assert!(toasts(&mut s).iter().any(|m| m.contains("Classic 3D doesn't draw")));
+}
+
+/// Importing a 3D model doesn't ask how to interpret its alpha (Interpret Footage): a model
+/// renders its own.
+#[test]
+fn importing_a_model_does_not_ask_about_alpha() {
+    let mut s = session();
+    assert_eq!(s.prefs.unlabeled_alpha(false), None, "Ask User");
+    let r = s.execute("file.import", json!({"paths": [fixture("quad.glb")]})).unwrap();
+    assert_eq!(r["unlabeledAlpha"], json!([]));
+    assert!(!s.drain_events().iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "file.interpretFootage")));
 }

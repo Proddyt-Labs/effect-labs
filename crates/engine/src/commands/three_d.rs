@@ -220,7 +220,9 @@ fn new_light(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let kind = match p.get("kind").or_else(|| p.get("type")) {
-        Some(_) => light_kind_p(p, "kind").or_else(|| light_kind_p(p, "type")).ok_or_else(|| bad("layer.newLight", "kind: Parallel|Spot|Point|Ambient"))?,
+        Some(_) => {
+            light_kind_p(p, "kind").or_else(|| light_kind_p(p, "type")).ok_or_else(|| bad("layer.newLight", "kind: Parallel|Spot|Point|Ambient|Environment"))?
+        }
         None => LightKind::Spot,
     };
     let name = str_p(p, "name").unwrap_or("Light 1").to_string();
@@ -239,9 +241,11 @@ fn light_settings(s: &mut Session, p: &Value) -> Result<Value> {
     let t = time_p(s, p, Some(&comp));
     let name = str_p(p, "name").map(str::to_string);
     let kind = match p.get("kind").or_else(|| p.get("type")) {
-        Some(_) => {
-            Some(light_kind_p(p, "kind").or_else(|| light_kind_p(p, "type")).ok_or_else(|| bad("layer.lightSettings", "kind: Parallel|Spot|Point|Ambient"))?)
-        }
+        Some(_) => Some(
+            light_kind_p(p, "kind")
+                .or_else(|| light_kind_p(p, "type"))
+                .ok_or_else(|| bad("layer.lightSettings", "kind: Parallel|Spot|Point|Ambient|Environment"))?,
+        ),
         None => None,
     };
     s.edit("Light Settings", None, |proj, _| {
@@ -314,6 +318,21 @@ fn set_3d_view(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let v = view_p(p, "view.set3DView")?;
     Ok(switch_view(s, cid, v))
+}
+
+/// The view of one pane of the View Layout: pane 0 is the main view (the same as Switch 3D View),
+/// panes 1 to 3 are the extra views of a 2- or 4-view layout. UI state, not part of the project.
+fn set_pane_view(s: &mut Session, p: &Value) -> Result<Value> {
+    let cid = comp_id(s, p)?;
+    let v = view_p(p, "view.setPaneView")?;
+    let pane = p.get("pane").and_then(Value::as_u64).filter(|n| *n <= 3).ok_or_else(|| bad("view.setPaneView", "pane: 0 (main view) to 3"))? as usize;
+    if pane == 0 {
+        switch_view(s, cid, v);
+    } else {
+        views(s, cid).set_pane(pane - 1, v);
+    }
+    let vs = views(s, cid);
+    Ok(json!({"pane": pane, "view": v.id(), "views": [vs.current.id(), vs.pane(0).id(), vs.pane(1).id(), vs.pane(2).id()]}))
 }
 
 macro_rules! view_cmd {
@@ -662,7 +681,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Light...",
             ["Layer", "New"],
             Some("Cmd+Alt+Shift+L"),
-            "{kind?: Parallel|Spot|Point|Ambient (default Spot), name?, color?, intensity?, coneAngle?, coneFeather?, falloff?: None|Smooth|Inverse Square Clamped, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position? [x,y,z], poi? [x,y,z]}",
+            "{kind?: Parallel|Spot|Point|Ambient|Environment (default Spot; Environment lights and reflects from an equirectangular image layer: prop.set its lightOptions/source to that layer's id, or leave it empty for the comp's Environment Layer, see layer.environment), name?, color?, intensity?, coneAngle?, coneFeather?, falloff?: None|Smooth|Inverse Square Clamped, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position? [x,y,z], poi? [x,y,z]}",
             has_comp,
             new_light
         ),
@@ -689,7 +708,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Light Settings...",
             [],
             None,
-            "{layer?, name?, kind?, color?, intensity?, coneAngle?, coneFeather?, falloff?, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position?, poi?}",
+            "{layer?, name?, kind?: Parallel|Spot|Point|Ambient|Environment, color?, intensity?, coneAngle?, coneFeather?, falloff?, radius?, falloffDistance?, castsShadows?, shadowDarkness?, shadowDiffusion?, position?, poi?}",
             has_comp,
             light_settings
         ),
@@ -701,6 +720,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{view: activeCamera|default|front|left|top|back|right|bottom|custom1|custom2|custom3, comp?}",
             has_comp,
             set_3d_view
+        ),
+        cmd!(
+            "view.setPaneView",
+            "Set View of Pane",
+            [],
+            None,
+            "{pane: 0 (main) | 1 | 2 | 3, view: activeCamera|default|front|left|top|back|right|bottom|custom1|custom2|custom3, comp?}",
+            has_comp,
+            set_pane_view
         ),
         cmd!("view.3d.activeCamera", "Active Camera", ["View", "Switch 3D View"], Some("F12"), "{comp?}", has_comp, view_active),
         cmd!("view.3d.default", "Default", ["View", "Switch 3D View"], None, "{comp?}", has_comp, view_default),

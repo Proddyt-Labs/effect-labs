@@ -1,8 +1,9 @@
 //! Layer render cache.
 //!
 //! The processed pixels of a layer (source → masks → effects, in layer space) depend only on the
-//! layer's own non-transform properties, its source item and the render options — not on its
-//! transform, opacity, blend mode or anything below it. [`LayerCache`] keeps those buffers keyed
+//! layer's non-transform properties, its source item, selected-layer dependencies and the render
+//! options. Its own transform is normally applied later; referenced layers' transforms can
+//! affect their sampled pixels. [`LayerCache`] keeps those buffers keyed
 //! by a content hash of exactly those inputs, *evaluated at the frame time*, so:
 //!
 //! * a static layer (or one whose only animation is in Transform) renders once and is reused on
@@ -24,6 +25,8 @@ use effectcraft_effects::Buf;
 use effectcraft_project::{ItemKind, Layer, LayerSource, Node, PropGroup};
 
 use crate::eval::EvalCtx;
+
+mod dependencies;
 
 /// Thread-safe, memory-budgeted cache of processed layer buffers, optionally backed by the
 /// persistent [`DiskCache`](crate::disk_cache::DiskCache): a memory miss reads the disk, and
@@ -420,8 +423,10 @@ fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
 
 /// Time-based layer content: does any part of the source/effects read the clock directly
 /// (rather than through property values)?
-fn time_dependent(layer: &Layer) -> bool {
-    if layer.switches.effects
+/// `effects: false` ignores the effects (a key of the source and masks only).
+fn time_dependent(layer: &Layer, effects: bool) -> bool {
+    if effects
+        && layer.switches.effects
         && let Some(fx) = layer.effects()
     {
         for g in fx.groups() {
@@ -492,7 +497,10 @@ pub fn layer_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bo
 /// effects (see `Renderer::layer_input`). Unlike [`layer_key`], footage layers are cached here
 /// (keyed by item and source time), since Time effects read many neighbouring frames.
 pub fn input_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, effects: usize) -> Option<u64> {
-    let base = key_with(ctx, layer, scale, draft, blur, true)?;
+    if layer.switches.adjustment {
+        return None;
+    }
+    let base = key_any(ctx, layer, scale, draft, blur, true, Some(effects))?;
     let mut h = KeyHasher(base ^ 0x5bd1_e995_7a3c_11d3);
     effects.hash(&mut h);
     Some(h.finish())
@@ -516,19 +524,27 @@ fn has_expression(g: &PropGroup) -> bool {
 /// Cache key for an adjustment layer's footprint (its source through its masks, see
 /// `Renderer::adjustment_footprint`): the GPU compositor then uploads it once, not every frame.
 pub fn footprint_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool) -> Option<u64> {
-    Some(derive(key_any(ctx, layer, scale, draft, blur, false)?, 0xf007_9417))
+    // The footprint is the source through the masks, without the effects: a time-dependent
+    // effect (Noise on a finishing adjustment layer) must not re-key it every frame (on the GPU,
+    // a full-frame re-upload per frame).
+    Some(derive(key_any(ctx, layer, scale, draft, blur, false, Some(0))?, 0xf007_9417))
 }
 
 fn key_with(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool) -> Option<u64> {
     if layer.switches.adjustment {
         return None;
     }
-    key_any(ctx, layer, scale, draft, blur, footage)
+    key_any(ctx, layer, scale, draft, blur, footage, None)
 }
 
-/// `blur`: the layer is motion blurred in this render (`Renderer::mb_on`).
-fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool) -> Option<u64> {
+/// `blur`: the layer is motion blurred in this render (`Renderer::mb_on`). `effects`: key only
+/// the first that many effects (a layer's input, see [`input_key`]).
+#[allow(clippy::too_many_arguments)]
+fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool, effects: Option<usize>) -> Option<u64> {
     let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
+    ctx.comp.frame_rate.as_f64().to_bits().hash(&mut h);
+    ctx.comp.enable_frame_blending.hash(&mut h);
+    dependencies::hash(&mut h, ctx, layer, effects)?;
     match &layer.source {
         LayerSource::Solid { item } => {
             let it = ctx.project.item(*item)?;
@@ -576,6 +592,24 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
         {
             continue;
         }
+        // A layer's input runs only its first effects: the later ones (a Puppet whose pins are
+        // dragged, #212) don't change it, so it stays cached.
+        if let (Some(n), Node::Group(g)) = (effects, c)
+            && g.match_id == "effects"
+        {
+            let mut first = g.clone();
+            let mut seen = 0;
+            first.children.retain(|e| match e {
+                Node::Prop(_) => true,
+                Node::Group(_) => {
+                    seen += 1;
+                    seen <= n
+                }
+            });
+            hash_debug(&mut h, &first);
+            hash_values(&mut h, ctx, layer, &first);
+            continue;
+        }
         // Static structure: values, keyframes, expressions, enabled flags, effect ids, modes.
         hash_debug(&mut h, c);
         if let Node::Group(g) = c {
@@ -591,13 +625,29 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             effectcraft_effects::paint::cache_key(g, lt).0.hash(&mut h);
         }
     }
-    if time_dependent(layer) {
+    if time_dependent(layer, effects != Some(0)) {
         layer.layer_time(ctx.time).0.hash(&mut h);
         // Effects also see the layer's time mapping.
         layer.start_time.0.hash(&mut h);
         layer.stretch.to_bits().hash(&mut h);
     }
+    // Effects that see the comp camera or lights (#397) change when they or the layer move.
+    if reads_comp_scene(layer) {
+        hash_debug(&mut h, &crate::comp_scene(ctx, layer));
+    }
     Some(h.finish())
+}
+
+/// Does the layer run an effect that reads the comp camera or lights (Card Dance, CC Particle
+/// World…)?
+fn reads_comp_scene(layer: &Layer) -> bool {
+    layer.switches.effects
+        && layer.effects().is_some_and(|fx| {
+            fx.groups().any(|g| {
+                g.enabled
+                    && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if effectcraft_effects::READS_COMP_SCENE.contains(&effect.as_str()))
+            })
+        })
 }
 
 /// Cache key for the styled layer (content key + the Layer Styles group: structure, eye

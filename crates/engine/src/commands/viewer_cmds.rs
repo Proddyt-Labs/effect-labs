@@ -3,14 +3,13 @@
 //! shape layers (`shape.newPath`).
 
 use effectcraft_keyframe::ShapePath;
-use effectcraft_project::LayerSource;
 use effectcraft_project::build::{self, Ids};
 use effectcraft_render::RenderOpts;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, b_p, bad, comp_id, f_p, has_comp, merge_p, str_p};
-use crate::viewer::{Channel, CustomRgb, SimProfile, Simulation, Snapshot};
+use crate::viewer::{Channel, CustomRgb, SimProfile, Simulation, SnapFeatures, Snapshot};
 use crate::{EngineError, Result, Session, VertexRef, cmd, query};
 
 /// Composition ▸ Preview ▸ Fast Previews modes.
@@ -110,11 +109,28 @@ fn snapping(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!(s.state.snapping))
 }
 
+/// Tools bar ▸ Snapping options: sets the options passed (`toggle` flips one by key).
+fn snapping_options(s: &mut Session, p: &Value) -> Result<Value> {
+    let f = &mut s.state.snap_features;
+    if let Some(k) = str_p(p, "toggle") {
+        let v = f.option_mut(k).ok_or_else(|| bad("view.snappingOptions", format!("unknown option `{k}`")))?;
+        *v = !*v;
+    }
+    for (k, _) in SnapFeatures::OPTIONS {
+        if let (Some(v), Some(o)) = (b_p(p, k), f.option_mut(k)) {
+            *o = v;
+        }
+    }
+    Ok(json!(s.state.snap_features))
+}
+
 fn channel(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "channel").unwrap_or("rgb");
     let c = Channel::from_name(name).ok_or_else(|| bad("view.channel", format!("unknown channel `{name}` (rgb|red|green|blue|alpha|rgbStraight)")))?;
-    // Choosing the active single channel again returns to RGB, as in After Effects.
-    let c = if c == s.state.viewer.channel && c != Channel::Rgb && b_p(p, "toggle").unwrap_or(false) { Channel::Rgb } else { c };
+    // Choosing the active single channel again returns to RGB; not when that changes it between
+    // grayscale and colorized.
+    let same = c == s.state.viewer.channel && b_p(p, "colorized").is_none_or(|v| v == s.state.viewer.colorized);
+    let c = if same && c != Channel::Rgb && b_p(p, "toggle").unwrap_or(false) { Channel::Rgb } else { c };
     s.state.viewer.channel = c;
     if let Some(v) = b_p(p, "colorized") {
         s.state.viewer.colorized = v;
@@ -159,6 +175,20 @@ fn show_snapshot(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!(s.state.viewer.show_snapshot))
 }
 
+/// A `view.fastPreviews.*` command choosing one Fast Previews mode.
+macro_rules! fast {
+    ($id:literal, $label:literal, $sc:literal, $mode:literal) => {
+        cmd!($id, $label, [], Some($sc), "{}", always, |s, _| fast_previews(s, &json!({"mode": $mode})))
+    };
+}
+
+/// A `view.channel.*` command showing one channel (again: back to RGB), in grayscale or colorized.
+macro_rules! chan {
+    ($id:literal, $label:literal, $sc:literal, $channel:literal, $colorized:literal) => {
+        cmd!($id, $label, [], Some($sc), "{}", always, |s, _| channel(s, &json!({"channel": $channel, "colorized": $colorized, "toggle": true})))
+    };
+}
+
 fn fast_previews(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "mode").unwrap_or("off");
     let m =
@@ -180,8 +210,12 @@ fn guide_index(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project
 fn move_guide(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, i) = guide_index(s, p, "view.moveGuide")?;
     let pos = f_p(p, "position").ok_or_else(|| bad("view.moveGuide", "missing `position` (comp px)"))?;
+    let pos = if pos.is_finite() { pos } else { return Err(bad("view.moveGuide", "`position` must be a finite number")) };
     s.edit("Move Guide", merge_p(p), |proj, _| {
-        proj.comp_mut(cid).ok_or(EngineError::NoComp)?.guides[i].position = pos;
+        let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+        let (w, h) = (c.width, c.height);
+        let g = c.guides.get_mut(i).ok_or(EngineError::NoComp)?;
+        g.set_px(pos, w, h);
         Ok(())
     })?;
     Ok(json!(pos))
@@ -200,20 +234,10 @@ fn pts(v: Option<&Value>) -> Vec<[f64; 2]> {
     v.and_then(Value::as_array).map(|a| a.iter().filter_map(|p| Some([p.get(0)?.as_f64()?, p.get(1)?.as_f64()?])).collect()).unwrap_or_default()
 }
 
-fn rgba(v: Option<&Value>, d: [f64; 4]) -> [f64; 4] {
-    match v {
-        Some(Value::Array(a)) => {
-            let g = |i: usize, d: f64| a.get(i).and_then(Value::as_f64).unwrap_or(d);
-            [g(0, d[0]), g(1, d[1]), g(2, d[2]), g(3, 1.0)]
-        }
-        Some(Value::String(h)) => effectcraft_color::Rgba::from_hex(h).map(|c| [c.r as f64, c.g as f64, c.b as f64, 1.0]).unwrap_or(d),
-        _ => d,
-    }
-}
-
-/// Pen tool on a shape layer: a new Shape group ("Shape n" with Path 1, Stroke 1 and Fill 1) on
-/// the given / selected shape layer, or on a new shape layer when none is given. Vertices are
-/// in the layer's space, or comp space (`space: "comp"`, the default for a new layer).
+/// Pen tool on a shape layer: a new Shape group ("Shape n" with Path 1 and the Tools bar's
+/// Stroke and Fill unless given) on the given / selected shape layer, or on a new shape layer
+/// when none is given. Vertices are in the layer's space, or comp space (`space: "comp"`, the
+/// default for a new layer).
 fn new_path(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
@@ -226,15 +250,7 @@ fn new_path(s: &mut Session, p: &Value) -> Result<Value> {
     let mut outs = pts(p.get("outTangents"));
     ins.resize(n, [0.0; 2]);
     outs.resize(n, [0.0; 2]);
-    let target = match p.get("layer") {
-        Some(l) => Some(super::resolve_layer(&comp, l).ok_or_else(|| bad("shape.newPath", format!("no layer {l}")))?),
-        None => s.state.selected_layers.iter().copied().find(|l| comp.layer(*l).is_some_and(|l| matches!(l.source, LayerSource::Shape) && !l.switches.locked)),
-    };
-    if let Some(l) = target.and_then(|l| comp.layer(l))
-        && !matches!(l.source, LayerSource::Shape)
-    {
-        return Err(bad("shape.newPath", "the layer is not a shape layer"));
-    }
+    let target = super::shape_tool::draw_target(s, &comp, p, "shape.newPath")?;
     let comp_space = str_p(p, "space").map(|s| s == "comp").unwrap_or(target.is_none());
     if comp_space {
         // Comp → layer space of the target (a new layer sits at the comp centre, unrotated).
@@ -255,38 +271,26 @@ fn new_path(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     let path = ShapePath { vertices: v, in_tangents: ins, out_tangents: outs, closed: b_p(p, "closed").unwrap_or(false), feather: Vec::new() };
-    let fill = (!matches!(p.get("fill"), Some(Value::Null) | Some(Value::Bool(false)))).then(|| rgba(p.get("fill"), [0.25, 0.55, 1.0, 1.0]));
-    let width = f_p(p, "strokeWidth").unwrap_or(2.0);
-    let stroke = (width > 0.0).then(|| rgba(p.get("stroke"), [1.0, 1.0, 1.0, 1.0]));
+    let paint = super::shape_tool::paint_p(p, &s.state.shape_tool, "shape.newPath")?;
+    // Gradients run across the path's points.
+    let (lo, hi) =
+        path.vertices.iter().fold(([f64::MAX; 2], [f64::MIN; 2]), |(lo, hi), v| ([lo[0].min(v[0]), lo[1].min(v[1])], [hi[0].max(v[0]), hi[1].max(v[1])]));
+    let bounds = [lo[0], lo[1], hi[0] - lo[0], hi[1] - lo[1]];
     let name = str_p(p, "name").map(str::to_string);
     let (lid, group, path_uid) = s.edit("Pen Tool", None, |proj, st| {
         let lid = match target {
             Some(l) => l,
-            None => {
-                let count = comp.layers.iter().filter(|l| matches!(l.source, LayerSource::Shape)).count();
-                let lname = name.clone().unwrap_or_else(|| format!("Shape Layer {}", count + 1));
-                let l = build::layer(proj, &comp, &lname, LayerSource::Shape, (comp.width, comp.height), None);
-                super::layer::insert_layer(proj, st, cid, l)?
-            }
+            None => super::shape_tool::new_shape_layer(proj, st, &comp, cid, name.as_deref(), None)?,
         };
         let mut next = proj.next_id;
-        let l = super::layer_mut(proj, cid, lid)?;
-        let contents = l.props.sub_mut("contents").ok_or_else(|| bad("shape.newPath", "the layer has no contents"))?;
-        let k = contents.groups().filter(|g| g.match_id == "group").count();
         let mut ids = Ids(&mut next);
         let pg = build::shape_path(&mut ids, path);
         let path_uid = pg.uid;
         let mut items = vec![pg];
-        if let Some(c) = stroke {
-            items.push(build::shape_stroke(&mut ids, c, width));
-        }
-        if let Some(c) = fill {
-            items.push(build::shape_fill(&mut ids, c));
-        }
-        let g = build::shape_group(&mut ids, &format!("Shape {}", k + 1), items);
-        let group = g.uid;
-        contents.children.insert(0, g.into());
+        items.extend(super::shape_tool::paint_items(&mut ids, &paint, bounds));
+        let g = build::shape_group(&mut ids, "Shape 1", items);
         proj.next_id = next;
+        let group = super::shape_tool::add_to_contents(proj, cid, lid, g, [0.0, 0.0], "shape.newPath")?;
         st.selected_layers = vec![lid];
         st.selected_vertices = vec![VertexRef { layer: lid, mask: path_uid, index: n - 1 }];
         Ok((lid, group, path_uid))
@@ -478,6 +482,15 @@ fn display_color_state(s: &mut Session, _: &Value) -> Result<Value> {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("view.snapping", "Snapping", ["View"], None, "{value?}", always, snapping),
+        cmd!(
+            "view.snappingOptions",
+            "Snapping Options",
+            [],
+            None,
+            "{edgesExtended? (Snap Edges Extended), collapsedFeatures? (Snap to Features in Collapsed Compositions and Text Layers): bool, toggle?: one of those keys} → the options",
+            always,
+            snapping_options
+        ),
         cmd!("view.displayColorManagement", "Use Display Color Management", ["View"], None, "{value?}", always, display_cm),
         cmd!(
             "view.simulateOutput",
@@ -511,6 +524,22 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("view.takeSnapshot", "Take Snapshot", [], Some("Shift+F5"), "{comp?, scale?: 0.05..1}", has_comp, take_snapshot),
         cmd!("view.showSnapshot", "Show Snapshot", [], None, "{value?}", has_snapshot, show_snapshot),
         cmd!("view.fastPreviewMode", "Fast Previews", [], None, "{mode: off|adaptive|draft|fastDraft|wireframe}", always, fast_previews),
+        fast!("view.fastPreviews.off", "Fast Previews: Off (Final Quality)", "Cmd+Alt+1", "off"),
+        fast!("view.fastPreviews.adaptive", "Fast Previews: Adaptive Resolution", "Cmd+Alt+2", "adaptive"),
+        fast!("view.fastPreviews.draft", "Fast Previews: Draft", "Cmd+Alt+3", "draft"),
+        fast!("view.fastPreviews.fastDraft", "Fast Previews: Fast Draft", "Cmd+Alt+4", "fastDraft"),
+        fast!("view.fastPreviews.wireframe", "Fast Previews: Wireframe", "Cmd+Alt+5", "wireframe"),
+        chan!("view.channel.red", "Show Channel: Red", "Alt+1", "red", false),
+        chan!("view.channel.green", "Show Channel: Green", "Alt+2", "green", false),
+        chan!("view.channel.blue", "Show Channel: Blue", "Alt+3", "blue", false),
+        chan!("view.channel.alpha", "Show Channel: Alpha", "Alt+4", "alpha", false),
+        chan!("view.channel.redColorized", "Show Channel: Red, Colorized", "Alt+Shift+1", "red", true),
+        chan!("view.channel.greenColorized", "Show Channel: Green, Colorized", "Alt+Shift+2", "green", true),
+        chan!("view.channel.blueColorized", "Show Channel: Blue, Colorized", "Alt+Shift+3", "blue", true),
+        cmd!("view.channel.rgbStraight", "Show Channel: RGB Straight", [], Some("Alt+Shift+4"), "{}", always, |s, _| channel(
+            s,
+            &json!({"channel": "rgbStraight", "toggle": true})
+        )),
         cmd!("view.moveGuide", "Move Guide", [], None, "{comp?, index, position (comp px), merge?}", has_comp, move_guide),
         cmd!("view.removeGuide", "Remove Guide", [], None, "{comp?, index}", has_comp, remove_guide),
         cmd!(
@@ -518,7 +547,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Pen Tool (Shape Path)",
             [],
             None,
-            "{layer?, vertices: [[x,y]…], inTangents?, outTangents?, closed?, space?: comp|layer, fill?: [r,g,b]|#hex|false, stroke?, strokeWidth?, name?}",
+            "{layer?, vertices: [[x,y]…], inTangents?, outTangents?, closed?, space?: comp|layer, fill?: [r,g,b]|#hex|false, fillType?, fillBlend?, fillOpacity?, stroke?, strokeType?, strokeBlend?, strokeOpacity?, strokeWidth? (default the Tools bar's, shape.toolOptions), name?}",
             shape_layer_or_none,
             new_path
         ),

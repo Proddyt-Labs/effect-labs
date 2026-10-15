@@ -61,6 +61,7 @@ device of their own), `?nosw` (don't register the service worker).
 | config directory: settings, shortcut presets, recent projects, the recovery sentinel | `store::WebConfig` in browser storage |
 | auto-save folder | `/EffectCraft Auto-Save/` in browser storage (`ConfigStore::files`) |
 | media reads (`MediaPool`, `probe`) | `files::WebImporter`: bytes from the file table, handed to `MediaPool::add_bytes` / `probe_bytes` |
+| Memory & CPU cache budgets, scaled to the system's RAM | the page's memory, at most 4 GiB (wasm32), which the caches share with the decoders' own decoded frames (FilmCraft keeps up to 384 MB per open movie): the Layer Cache stays within 512 MB and the Footage Frame Cache within 256 MB (`Prefs::cache_budgets`) |
 | export writes (`effectcraft-export`) | the job's `sink` (`effectcraft_host::FileExporter { sink }`): files land in the table and download after the render; several files (an image sequence) download as one stored `.zip` |
 | rfd file dialogs | `<input type=file>` for File ▸ Open / Import; drop files anywhere on the page (`.ecproj` opens, everything else imports); "Save As" / "Output To" pick a download name |
 | Media Browser on the file system | browser storage and folders opened with the File System Access API (below) |
@@ -171,9 +172,9 @@ the same futures with `passes::block_on`; they never wait there).
 
 - **Render Queue**: `effectcraft_export::export_async` renders each frame in passes (frames
   with deferred readbacks render one by one instead of in parallel batches) and encodes as
-  before (`Exporter::export_async`). Renders use Backend Auto, as on the desktop: per comp
-  the worker warms up both sides (GPU first) and then renders on the faster one, each frame's
-  time measured across all its passes.
+  before (`Exporter::export_async`). As on the desktop, a job renders every frame on the
+  project's renderer (the worker's GPU with Mercury GPU Acceleration), not on whichever
+  compositor measured faster, so runs don't differ by timing.
 - **Analyses** (Warp Stabilizer, 3D Camera Tracker, Track Motion, mask and face tracking, Roto
   Brush freeze and propagation): their work functions are `async`; started with `wait` inside
   a job they are queued and awaited (`offload::run_or_queue`), and each input frame renders in
@@ -230,7 +231,8 @@ Window ▸ Media Browser browses a virtual tree (`src/browse.rs`):
 
 - **Browser Storage**: every file in browser storage (imported media, saved projects, files added
   with **Add Files…** or **Upload Folder…**, plain file inputs that work in every browser). This is
-  the persistent recent list where folders can't be opened.
+  the persistent recent list where folders can't be opened. A picked file that can't be read is
+  named in the status bar with the browser's reason, and the others are still added.
 - **Folders**: **Open Folder…** (File System Access API, `showDirectoryPicker`, Chromium) lists a
   folder from the user's disk; only the listing is read, and a file's bytes are read when it is
   imported (then kept in browser storage). The folder handles are remembered in IndexedDB; after
@@ -261,6 +263,13 @@ drawn straight from their texture, with no readback. The Info panel's pixel read
 eyedroppers read GPU frames back asynchronously (`Gpu::read_display_async`: the pixels arrive a
 frame later). On WebGL2, or without a usable adapter, everything renders on the CPU.
 `effectcraft.info().gpu` reports `{compositor, viewerOnGpu}`.
+
+If the page's WebGPU device is lost (a driver reset, the browser reclaiming the GPU), the canvas
+can't show anything new, while the project stays open and commands keep working. The page then
+covers the canvas with a notice (`showDeviceLost` in `js/host.js`) offering **Save Project** (a
+download) and **Reload**, which first writes pending changes to browser storage
+(`effectcraft.flush()`) so the session comes back after the reload; when the write fails it says
+so and offers **Reload Anyway**.
 
 **GPU effects run in the frame workers.** A browser never lets JavaScript (or wasm) wait for a GPU
 readback, not even in a worker: a buffer maps only once the thread returns to its event loop.
@@ -384,7 +393,7 @@ with the method's `result`, errors reject with the message.
 | `effectcraft.saveToBrowser(path?)` | save the project to browser storage without downloading it (default: its path, or `/<name>.ecproj`); resolves with `{path, bytes}` |
 | `effectcraft.listStored()` | `{backend, usage, quota, persisted, pending, files: [{path, size, modified}], config: [name]}` |
 | `effectcraft.removeStored(path)` | delete a stored file |
-| `effectcraft.flush()` | resolves once every change is written to browser storage |
+| `effectcraft.flush()` | resolves once every change is written to browser storage; rejects when a write failed (quota exceeded…: the change stays pending and is retried) |
 | `effectcraft.info()` | graphics backend, `gpu`, `storage`, `audio` (`{state, sampleRate, backend, posted, played, underruns}`), `workers`, `frameWorkers`, `diskCache`, `restored`, `webgpu`, `serviceWorker`, version, `crossOriginIsolated`, load timings |
 | `effectcraft.workerFrameCheck(params)` | a frame rendered in a frame worker (its GPU by default) against the page's CPU render: `{width, height, maxDiff, meanDiff, over4, workerMs}` |
 
@@ -412,6 +421,16 @@ reload through the service worker. It writes screenshots and `report.json`:
 cargo xtask web --serve 8765 &
 node apps/effectcraft-web/tests/smoke.mjs --url http://127.0.0.1:8765/ --out target/web/smoke
 ```
+
+`apps/effectcraft-web/tests/workers.mjs` checks the job-worker plumbing (`js/host.js`,
+`web/worker.js`) under Node with a fake `Worker`, without a build: a replaced file is sent to a
+reused worker again even at the same size, and a worker that fails to start fails its job and is
+terminated (`node apps/effectcraft-web/tests/workers.mjs`).
+
+`apps/effectcraft-web/tests/page.mjs` checks page-side helpers of `js/host.js` the same way with
+a fake DOM: a picked file that can't be read is reported while the others are added, and the
+device-lost notice saves, flushes before reloading and reports a failed flush
+(`node apps/effectcraft-web/tests/page.mjs`).
 
 It also checks the M13.10 paths: viewer frames rendered in frame workers while scrubbing with the
 CPU renderer (project synced as diffs, event-loop gaps under 400 ms), a `wait: true` render that
